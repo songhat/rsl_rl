@@ -56,6 +56,16 @@ class RolloutStorage:
             self.privileged_actions: torch.Tensor | None = None
             """Privileged (teacher) actions (distillation only)."""
 
+            # For FPO
+            self.fpo_loss_eps: torch.Tensor | None = None
+            """Sampled noise for CFM loss (FPO only)."""
+
+            self.fpo_loss_t: torch.Tensor | None = None
+            """Sampled time steps for CFM loss (FPO only)."""
+
+            self.fpo_initial_cfm_loss: torch.Tensor | None = None
+            """Initial CFM loss per sample (FPO only)."""
+
             # For recurrent networks
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
             """Hidden states for recurrent networks, e.g., (actor, critic)."""
@@ -84,6 +94,9 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            fpo_loss_eps: torch.Tensor | None = None,
+            fpo_loss_t: torch.Tensor | None = None,
+            fpo_initial_cfm_loss: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -115,6 +128,15 @@ class RolloutStorage:
             self.dones: torch.Tensor | None = dones
             """Batch of done flags (distillation only)."""
 
+            self.fpo_loss_eps: torch.Tensor | None = fpo_loss_eps
+            """Batch of sampled CFM noise (FPO only)."""
+
+            self.fpo_loss_t: torch.Tensor | None = fpo_loss_t
+            """Batch of sampled CFM time steps (FPO only)."""
+
+            self.fpo_initial_cfm_loss: torch.Tensor | None = fpo_initial_cfm_loss
+            """Batch of initial CFM losses (FPO only)."""
+
             # For recurrent networks
             self.hidden_states: tuple[HiddenState, HiddenState] = hidden_states
             """Batch of hidden states for recurrent networks (RL recurrent only)."""
@@ -130,6 +152,7 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        num_fpo_samples: int | None = None,
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape."""
         self.training_type = training_type
@@ -162,6 +185,23 @@ class RolloutStorage:
             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+
+        # For flow policy optimization
+        if training_type == "fpo":
+            if num_fpo_samples is None:
+                raise ValueError("num_fpo_samples must be provided for FPO training.")
+            self.num_fpo_samples = num_fpo_samples
+            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            action_dim = actions_shape[0] if actions_shape else 1
+            self.fpo_loss_eps = torch.zeros(
+                num_transitions_per_env, num_envs, num_fpo_samples, action_dim, device=self.device
+            )
+            self.fpo_loss_t = torch.zeros(num_transitions_per_env, num_envs, num_fpo_samples, 1, device=self.device)
+            self.fpo_initial_cfm_loss = torch.zeros(
+                num_transitions_per_env, num_envs, num_fpo_samples, device=self.device
+            )
 
         # For recurrent networks
         self.saved_hidden_state_a = None
@@ -197,6 +237,13 @@ class RolloutStorage:
                 )
             for i, p in enumerate(transition.distribution_params):  # type: ignore
                 self.distribution_params[i][self.step].copy_(p)
+
+        # For flow policy optimization
+        if self.training_type == "fpo":
+            self.values[self.step].copy_(transition.values)  # type: ignore
+            self.fpo_loss_eps[self.step].copy_(transition.fpo_loss_eps)  # type: ignore
+            self.fpo_loss_t[self.step].copy_(transition.fpo_loss_t)  # type: ignore
+            self.fpo_initial_cfm_loss[self.step].copy_(transition.fpo_initial_cfm_loss)  # type: ignore
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -255,6 +302,40 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                )
+
+    def fpo_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[Batch, None, None]:
+        """Yield shuffled flat mini-batches for feedforward FPO updates."""
+        if self.training_type != "fpo":
+            raise ValueError("This function is only available for flow policy optimization training.")
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+
+        observations = self.observations.flatten(0, 1)
+        actions = self.actions.flatten(0, 1)
+        values = self.values.flatten(0, 1)
+        returns = self.returns.flatten(0, 1)
+        advantages = self.advantages.flatten(0, 1)
+        fpo_loss_eps = self.fpo_loss_eps.flatten(0, 1)
+        fpo_loss_t = self.fpo_loss_t.flatten(0, 1)
+        fpo_initial_cfm_loss = self.fpo_initial_cfm_loss.flatten(0, 1)
+
+        for epoch in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+                batch_idx = indices[start:stop]
+
+                yield RolloutStorage.Batch(
+                    observations=observations[batch_idx],  # type: ignore
+                    actions=actions[batch_idx],
+                    values=values[batch_idx],
+                    advantages=advantages[batch_idx],
+                    returns=returns[batch_idx],
+                    fpo_loss_eps=fpo_loss_eps[batch_idx],
+                    fpo_loss_t=fpo_loss_t[batch_idx],
+                    fpo_initial_cfm_loss=fpo_initial_cfm_loss[batch_idx],
                 )
 
     # For reinforcement learning with recurrent networks

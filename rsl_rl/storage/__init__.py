@@ -5,6 +5,7 @@
 
 """Storage for the learning algorithms."""
 
+from .circular_buffer import CircularBuffer
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["CircularBuffer", "RolloutStorage"]

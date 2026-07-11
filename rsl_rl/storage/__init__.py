@@ -5,6 +5,18 @@
 
 """Storage for the learning algorithms."""
 
+from .circular_buffer import CircularBuffer
+from .disc_replay_buffer import (
+    DiscReplayBuffer,
+    agent_disc_obs_with_replay,
+    store_disc_replay_from_rollout,
+)
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = [
+    "CircularBuffer",
+    "DiscReplayBuffer",
+    "RolloutStorage",
+    "agent_disc_obs_with_replay",
+    "store_disc_replay_from_rollout",
+]

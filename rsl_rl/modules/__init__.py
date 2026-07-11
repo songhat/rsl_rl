@@ -8,12 +8,14 @@
 from .cnn import CNN
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
+from .moe import MoEMLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
 
 __all__ = [
     "CNN",
     "MLP",
+    "MoEMLP",
     "RNN",
     "BetaDistribution",
     "Distribution",

@@ -6,6 +6,9 @@
 """Learning algorithms."""
 
 from .distillation import Distillation
+from .fpo import FPO
+from .fpo_amp import FPOAMP
 from .ppo import PPO
+from .ppo_amp import PPOAMP
 
-__all__ = ["PPO", "Distillation"]
+__all__ = ["PPO", "PPOAMP", "FPO", "FPOAMP", "Distillation"]

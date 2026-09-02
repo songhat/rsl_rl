@@ -10,5 +10,8 @@ from .fpo import FPO
 from .fpo_amp import FPOAMP
 from .ppo import PPO
 from .ppo_amp import PPOAMP
+from .ppo_ase import PPOASE
+from .ppo_decoupled import PPODecoupled
+from .ppo_smp import PPOSMP
 
-__all__ = ["PPO", "PPOAMP", "FPO", "FPOAMP", "Distillation"]
+__all__ = ["PPO", "PPOAMP", "PPOASE", "PPOSMP", "FPO", "FPOAMP", "Distillation", "PPODecoupled"]

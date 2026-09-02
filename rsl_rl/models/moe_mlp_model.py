@@ -32,7 +32,13 @@ class MoEMLPModel(MLPModel):
         num_experts: int = 4,
         gate_hidden_dims: tuple[int, ...] | list[int] | None = None,
         top_k: int | None = None,
+        # Accepted for RslRlModelCfg asdict compatibility; unused by MoE.
+        cnn_cfg: dict | None = None,
+        rnn_type: str | None = None,
+        rnn_hidden_dim: int = 256,
+        rnn_num_layers: int = 1,
     ) -> None:
+        del cnn_cfg, rnn_type, rnn_hidden_dim, rnn_num_layers
         nn.Module.__init__(self)
 
         self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)

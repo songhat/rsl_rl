@@ -32,6 +32,7 @@ dependencies = [
     "scipy>=1.7.0",
     "tensorboard",
     "GitPython",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon.git",
     "onnx",
     "onnxscript>=0.5.4",
 ]

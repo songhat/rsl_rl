@@ -11,8 +11,10 @@ from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import FPOModel, MLPModel
 from rsl_rl.models.discriminator_model import AMPDiscriminator, LossType, resolve_amp_config
-from rsl_rl.storage import CircularBuffer, RolloutStorage
-from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups
+from rsl_rl.algorithms.amp_replay_utils import compute_amp_disc_loss
+from rsl_rl.storage import CircularBuffer, DiscReplayBuffer, RolloutStorage
+from rsl_rl.storage.disc_replay_buffer import agent_disc_obs_with_replay, store_disc_replay_from_rollout
+from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
 
 class FPOAMP(FPO):
@@ -26,6 +28,7 @@ class FPOAMP(FPO):
         disc_obs_buffer: CircularBuffer,
         disc_demo_obs_buffer: CircularBuffer,
         obs_groups: dict,
+        disc_replay_buffer: DiscReplayBuffer | None = None,
         amp_cfg: dict | None = None,
         **kwargs,
     ) -> None:
@@ -68,11 +71,16 @@ class FPOAMP(FPO):
                 "weight_decay": self.amp_cfg["disc_linear_weight_decay"],
             },
         ]
-        self.disc_optimizer = optim.Adam(params, lr=self.amp_cfg["disc_learning_rate"])
+        disc_optimizer_name = self.amp_cfg.get("disc_optimizer", "adam")
+        self.disc_optimizer = resolve_optimizer(disc_optimizer_name)(
+            params, lr=self.amp_cfg["disc_learning_rate"]
+        )
         self.disc_max_grad_norm = self.amp_cfg.get("disc_max_grad_norm", 0.5)
 
         self.disc_obs_buffer = disc_obs_buffer
         self.disc_demo_obs_buffer = disc_demo_obs_buffer
+        self.disc_replay_buffer = disc_replay_buffer
+        self.disc_replay_samples = int(self.amp_cfg.get("disc_replay_samples", 1000))
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -104,6 +112,15 @@ class FPOAMP(FPO):
         mean_disc_grad_penalty = 0.0
         mean_disc_score = 0.0
         mean_disc_demo_score = 0.0
+        mean_disc_replay_score = 0.0
+
+        fetch_length = self.storage.num_transitions_per_env  # type: ignore
+        replay_pushed = store_disc_replay_from_rollout(
+            self.disc_obs_buffer,
+            self.disc_replay_buffer,
+            fetch_length=fetch_length,
+            replay_samples=self.disc_replay_samples,
+        )
 
         generator = self.storage.fpo_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         disc_obs_generator = self.disc_obs_buffer.mini_batch_generator(
@@ -154,34 +171,28 @@ class FPOAMP(FPO):
             loss = surrogate_loss + self.value_loss_coef * value_loss
 
             with torch.no_grad():
-                disc_obs_batch_normed = self.amp_discriminator.normalize_disc_obs(disc_obs_batch)
                 disc_demo_obs_batch_normed = self.amp_discriminator.normalize_disc_obs(disc_demo_obs_batch)
 
-            mini_batch_size = disc_obs_batch_normed.shape[0]
-            disc_score = self.amp_discriminator(disc_obs_batch_normed.reshape(mini_batch_size, -1))
-            disc_demo_score = self.amp_discriminator(disc_demo_obs_batch_normed.reshape(mini_batch_size, -1))
-
-            if self.loss_type == LossType.GAN:
-                bce = torch.nn.BCEWithLogitsLoss()
-                policy_loss = bce(disc_score, torch.zeros_like(disc_score, device=self.device))
-                demo_loss = bce(disc_demo_score, torch.ones_like(disc_demo_score, device=self.device))
-                disc_loss = 0.5 * (policy_loss + demo_loss)
-            elif self.loss_type == LossType.LSGAN:
-                policy_loss = torch.nn.MSELoss()(disc_score, -1 * torch.ones_like(disc_score, device=self.device))
-                demo_loss = torch.nn.MSELoss()(disc_demo_score, torch.ones_like(disc_demo_score, device=self.device))
-                disc_loss = 0.5 * (policy_loss + demo_loss)
-            elif self.loss_type == LossType.WGAN:
-                disc_loss = -torch.mean(disc_demo_score) + torch.mean(disc_score)
-            else:
-                raise ValueError(
-                    f"Unknown AMP loss type: {self.loss_type}. Should be 'GAN', 'LSGAN', or 'WGAN'"
-                )
-
-            disc_grad_penalty = self.amp_discriminator.compute_grad_penalty(
-                demo_data=disc_demo_obs_batch_normed.reshape(mini_batch_size, -1),
-                scale=self.amp_cfg["grad_penalty_scale"],
+            agent_disc_flat, current_batch_size = agent_disc_obs_with_replay(
+                self.amp_discriminator,
+                disc_obs_batch,
+                self.disc_replay_buffer,
             )
-            disc_total_loss = disc_loss + disc_grad_penalty
+            disc_score = self.amp_discriminator(agent_disc_flat)
+            disc_demo_score = self.amp_discriminator(
+                disc_demo_obs_batch_normed.reshape(current_batch_size, -1)
+            )
+
+            disc_loss, disc_grad_penalty = compute_amp_disc_loss(
+                self.amp_discriminator,
+                self.loss_type,
+                disc_score,
+                disc_demo_score,
+                disc_demo_obs_batch_normed.reshape(current_batch_size, -1),
+                agent_disc_flat[:current_batch_size],
+                self.amp_cfg["grad_penalty_scale"],
+            )
+            disc_total_loss = disc_loss
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -204,8 +215,10 @@ class FPOAMP(FPO):
             mean_policy_ratio += ratio.mean().item()
             mean_disc_loss += disc_loss.item()
             mean_disc_grad_penalty += disc_grad_penalty.item()
-            mean_disc_score += disc_score.mean().item()
+            mean_disc_score += disc_score[:current_batch_size].mean().item()
             mean_disc_demo_score += disc_demo_score.mean().item()
+            if disc_score.shape[0] > current_batch_size:
+                mean_disc_replay_score += disc_score[current_batch_size:].mean().item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         self.storage.clear()
@@ -219,6 +232,9 @@ class FPOAMP(FPO):
             "amp/disc_grad_penalty": mean_disc_grad_penalty / num_updates,
             "amp/disc_score": mean_disc_score / num_updates,
             "amp/disc_demo_score": mean_disc_demo_score / num_updates,
+            "amp/disc_replay_score": mean_disc_replay_score / num_updates,
+            "amp/disc_replay_size": float(len(self.disc_replay_buffer)) if self.disc_replay_buffer else 0.0,
+            "amp/disc_replay_pushed": float(replay_pushed),
         }
 
     def train_mode(self) -> None:
@@ -329,6 +345,11 @@ class FPOAMP(FPO):
             device=device,
         )
 
+        disc_replay_buffer = None
+        replay_size = cfg["algorithm"]["amp_cfg"].get("disc_replay_buffer_size")
+        if replay_size:
+            disc_replay_buffer = DiscReplayBuffer(max_size=int(replay_size), device=device)
+
         alg: FPOAMP = alg_class(
             actor,
             critic,
@@ -336,6 +357,7 @@ class FPOAMP(FPO):
             disc_obs_buffer,
             disc_demo_obs_buffer,
             cfg["obs_groups"],
+            disc_replay_buffer,
             device=device,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],

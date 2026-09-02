@@ -11,8 +11,10 @@ from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.models.discriminator_model import AMPDiscriminator, LossType, resolve_amp_config
-from rsl_rl.storage import CircularBuffer, RolloutStorage
-from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups
+from rsl_rl.algorithms.amp_replay_utils import compute_amp_disc_loss
+from rsl_rl.storage import CircularBuffer, DiscReplayBuffer, RolloutStorage
+from rsl_rl.storage.disc_replay_buffer import agent_disc_obs_with_replay, store_disc_replay_from_rollout
+from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
 
 class PPOAMP(PPO):
@@ -24,6 +26,7 @@ class PPOAMP(PPO):
         disc_obs_buffer: CircularBuffer,
         disc_demo_obs_buffer: CircularBuffer,
         obs_groups: dict,
+        disc_replay_buffer: DiscReplayBuffer | None = None,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -39,6 +42,9 @@ class PPOAMP(PPO):
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
         device: str = "cpu",
+        muon_learning_rate: float = 0.02,
+        muon_momentum: float = 0.95,
+        muon_weight_decay: float = 0.0,
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
         amp_cfg: dict | None = None,
@@ -63,6 +69,9 @@ class PPOAMP(PPO):
             desired_kl,
             normalize_advantage_per_mini_batch,
             device,
+            muon_learning_rate,
+            muon_momentum,
+            muon_weight_decay,
             rnd_cfg,
             symmetry_cfg,
             multi_gpu_cfg,
@@ -105,11 +114,44 @@ class PPOAMP(PPO):
                 "weight_decay": self.amp_cfg["disc_linear_weight_decay"],
             },
         ]
-        self.disc_optimizer = optim.Adam(params, lr=self.amp_cfg["disc_learning_rate"])
-        self.disc_max_grad_norm = self.amp_cfg.get("disc_max_grad_norm", 0.5)
+        disc_optimizer_name = self.amp_cfg.get("disc_optimizer", "adam")
+        disc_opt_kwargs: dict = {"lr": self.amp_cfg["disc_learning_rate"]}
+        disc_betas = self.amp_cfg.get("disc_optimizer_betas")
+        if disc_betas is not None and disc_optimizer_name in ("adam", "adamw"):
+            disc_opt_kwargs["betas"] = tuple(disc_betas)
+        self.disc_optimizer = resolve_optimizer(disc_optimizer_name)(params, **disc_opt_kwargs)
+        # <=0 disables clipping (WGAN-GP uses GP instead of weight/grad clipping).
+        self.disc_max_grad_norm = float(self.amp_cfg.get("disc_max_grad_norm", 0.5))
+        self.freeze_discriminator = bool(self.amp_cfg.get("freeze_discriminator", False))
+        if self.freeze_discriminator:
+            self.amp_discriminator.eval()
+            self.amp_discriminator.requires_grad_(False)
 
         self.disc_obs_buffer = disc_obs_buffer
         self.disc_demo_obs_buffer = disc_demo_obs_buffer
+        self.disc_replay_buffer = disc_replay_buffer
+        self.disc_replay_samples = int(self.amp_cfg.get("disc_replay_samples", 1000))
+        # Independent discriminator update schedule.
+        self.disc_num_learning_epochs = int(
+            self.amp_cfg.get("disc_num_learning_epochs", self.num_learning_epochs)
+        )
+        self.disc_num_mini_batches = int(
+            self.amp_cfg.get("disc_num_mini_batches", self.num_mini_batches)
+        )
+        self.disc_update_interval = max(1, int(self.amp_cfg.get("disc_update_interval", 1)))
+        # Lazy GP: D still steps every mini-batch; GP (2nd-order) only every N steps.
+        self.disc_grad_penalty_interval = max(1, int(self.amp_cfg.get("disc_grad_penalty_interval", 1)))
+        self.disc_grad_penalty_batch_frac = float(self.amp_cfg.get("disc_grad_penalty_batch_frac", 1.0))
+        self._amp_update_count = 0
+        self._disc_step_count = 0
+        # Last logged disc metrics (carried across skipped update intervals).
+        self._last_disc_metrics = {
+            "amp/disc_loss": 0.0,
+            "amp/disc_grad_penalty": 0.0,
+            "amp/disc_score": 0.0,
+            "amp/disc_demo_score": 0.0,
+            "amp/disc_replay_score": 0.0,
+        }
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -142,24 +184,23 @@ class PPOAMP(PPO):
         mean_disc_grad_penalty = 0
         mean_disc_score = 0
         mean_disc_demo_score = 0
+        mean_disc_replay_score = 0
 
+        fetch_length = self.storage.num_transitions_per_env  # type: ignore
+        replay_pushed = store_disc_replay_from_rollout(
+            self.disc_obs_buffer,
+            self.disc_replay_buffer,
+            fetch_length=fetch_length,
+            replay_samples=self.disc_replay_samples,
+        )
+
+        # ---- Actor-critic PPO updates ----
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        disc_obs_generator = self.disc_obs_buffer.mini_batch_generator(
-            fetch_length=self.storage.num_transitions_per_env,  # type: ignore
-            num_mini_batches=self.num_mini_batches,
-            num_epochs=self.num_learning_epochs,
-        )
-        disc_demo_obs_generator = self.disc_demo_obs_buffer.mini_batch_generator(
-            fetch_length=self.storage.num_transitions_per_env,  # type: ignore
-            num_mini_batches=self.num_mini_batches,
-            num_epochs=self.num_learning_epochs,
-        )
-
-        for batch, disc_obs_batch, disc_demo_obs_batch in zip(generator, disc_obs_generator, disc_demo_obs_generator):
+        for batch in generator:
             original_batch_size = batch.observations.batch_size[0]
 
             if self.normalize_advantage_per_mini_batch:
@@ -200,8 +241,7 @@ class PPOAMP(PPO):
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
 
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                    self.set_learning_rate(self.learning_rate)
 
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
             surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
@@ -228,55 +268,24 @@ class PPOAMP(PPO):
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
-            with torch.no_grad():
-                disc_obs_batch_normed = self.amp_discriminator.normalize_disc_obs(disc_obs_batch)
-                disc_demo_obs_batch_normed = self.amp_discriminator.normalize_disc_obs(disc_demo_obs_batch)
-
-            mini_batch_size = disc_obs_batch_normed.shape[0]
-            disc_score = self.amp_discriminator(disc_obs_batch_normed.reshape(mini_batch_size, -1))
-            disc_demo_score = self.amp_discriminator(disc_demo_obs_batch_normed.reshape(mini_batch_size, -1))
-
-            if self.loss_type == LossType.GAN:
-                bce = torch.nn.BCEWithLogitsLoss()
-                policy_loss = bce(disc_score, torch.zeros_like(disc_score, device=self.device))
-                demo_loss = bce(disc_demo_score, torch.ones_like(disc_demo_score, device=self.device))
-                disc_loss = 0.5 * (policy_loss + demo_loss)
-            elif self.loss_type == LossType.LSGAN:
-                policy_loss = torch.nn.MSELoss()(disc_score, -1 * torch.ones_like(disc_score, device=self.device))
-                demo_loss = torch.nn.MSELoss()(disc_demo_score, torch.ones_like(disc_demo_score, device=self.device))
-                disc_loss = 0.5 * (policy_loss + demo_loss)
-            elif self.loss_type == LossType.WGAN:
-                disc_loss = -torch.mean(disc_demo_score) + torch.mean(disc_score)
-            else:
-                raise ValueError(
-                    f"Unknown AMP loss type: {self.loss_type}. Should be 'GAN', 'LSGAN', or 'WGAN'"
-                )
-
-            disc_grad_penalty = self.amp_discriminator.compute_grad_penalty(
-                demo_data=disc_demo_obs_batch_normed.reshape(mini_batch_size, -1),
-                scale=self.amp_cfg["grad_penalty_scale"],
-            )
-            disc_total_loss = disc_loss + disc_grad_penalty
-
             self.optimizer.zero_grad()
+            if self.muon_optimizer is not None:
+                self.muon_optimizer.zero_grad()
             loss.backward()
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
                 rnd_loss.backward()
-            self.disc_optimizer.zero_grad()
-            disc_total_loss.backward()
 
             if self.is_multi_gpu:
-                self.reduce_parameters()
+                self.reduce_parameters(include_disc=False)
 
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            if self.muon_optimizer is not None:
+                self.muon_optimizer.step()
             if self.rnd:
                 self.rnd.optimizer.step()
-            nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.disc_max_grad_norm)
-            self.disc_optimizer.step()
-            self.amp_discriminator.update_normalization(disc_obs_batch)
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -285,23 +294,99 @@ class PPOAMP(PPO):
                 mean_rnd_loss += rnd_loss.item()
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            mean_disc_loss += disc_loss.item()
-            mean_disc_grad_penalty += disc_grad_penalty.item()
-            mean_disc_score += disc_score.mean().item()
-            mean_disc_demo_score += disc_demo_score.mean().item()
 
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        mean_entropy /= num_updates
+        num_ac_updates = self.num_learning_epochs * self.num_mini_batches
+        mean_value_loss /= num_ac_updates
+        mean_surrogate_loss /= num_ac_updates
+        mean_entropy /= num_ac_updates
         if mean_rnd_loss is not None:
-            mean_rnd_loss /= num_updates
+            mean_rnd_loss /= num_ac_updates
         if mean_symmetry_loss is not None:
-            mean_symmetry_loss /= num_updates
-        mean_disc_loss /= num_updates
-        mean_disc_grad_penalty /= num_updates
-        mean_disc_score /= num_updates
-        mean_disc_demo_score /= num_updates
+            mean_symmetry_loss /= num_ac_updates
+
+        # ---- Discriminator updates (optional interval / epoch count) ----
+        update_disc = (not self.freeze_discriminator) and (
+            self._amp_update_count % self.disc_update_interval == 0
+        )
+        num_disc_updates = 0
+        if update_disc:
+            disc_obs_generator = self.disc_obs_buffer.mini_batch_generator(
+                fetch_length=fetch_length,
+                num_mini_batches=self.disc_num_mini_batches,
+                num_epochs=self.disc_num_learning_epochs,
+            )
+            disc_demo_obs_generator = self.disc_demo_obs_buffer.mini_batch_generator(
+                fetch_length=fetch_length,
+                num_mini_batches=self.disc_num_mini_batches,
+                num_epochs=self.disc_num_learning_epochs,
+            )
+            for disc_obs_batch, disc_demo_obs_batch in zip(disc_obs_generator, disc_demo_obs_generator):
+                with torch.no_grad():
+                    disc_demo_obs_batch_normed = self.amp_discriminator.normalize_disc_obs(disc_demo_obs_batch)
+
+                agent_disc_flat, current_batch_size = agent_disc_obs_with_replay(
+                    self.amp_discriminator,
+                    disc_obs_batch,
+                    self.disc_replay_buffer,
+                )
+                disc_score = self.amp_discriminator(agent_disc_flat)
+                disc_demo_score = self.amp_discriminator(
+                    disc_demo_obs_batch_normed.reshape(current_batch_size, -1)
+                )
+
+                apply_gp = self._disc_step_count % self.disc_grad_penalty_interval == 0
+                disc_loss, disc_grad_penalty = compute_amp_disc_loss(
+                    self.amp_discriminator,
+                    self.loss_type,
+                    disc_score,
+                    disc_demo_score,
+                    disc_demo_obs_batch_normed.reshape(current_batch_size, -1),
+                    agent_disc_flat[:current_batch_size],
+                    float(self.amp_cfg["grad_penalty_scale"]),
+                    apply_grad_penalty=apply_gp,
+                    gp_batch_frac=self.disc_grad_penalty_batch_frac,
+                )
+
+                self.disc_optimizer.zero_grad()
+                disc_loss.backward()
+                if self.is_multi_gpu:
+                    self.reduce_disc_parameters()
+                if self.disc_max_grad_norm > 0.0:
+                    nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.disc_max_grad_norm)
+                self.disc_optimizer.step()
+                self.amp_discriminator.update_normalization(disc_obs_batch)
+                self._disc_step_count += 1
+
+                mean_disc_loss += disc_loss.item()
+                mean_disc_grad_penalty += disc_grad_penalty.item()
+                mean_disc_score += disc_score.mean().item()
+                mean_disc_demo_score += disc_demo_score.mean().item()
+                if disc_score.shape[0] > current_batch_size:
+                    mean_disc_replay_score += disc_score[current_batch_size:].mean().item()
+                num_disc_updates += 1
+
+            if num_disc_updates > 0:
+                mean_disc_loss /= num_disc_updates
+                mean_disc_grad_penalty /= num_disc_updates
+                mean_disc_score /= num_disc_updates
+                mean_disc_demo_score /= num_disc_updates
+                mean_disc_replay_score /= num_disc_updates
+                self._last_disc_metrics = {
+                    "amp/disc_loss": mean_disc_loss,
+                    "amp/disc_grad_penalty": mean_disc_grad_penalty,
+                    "amp/disc_score": mean_disc_score,
+                    "amp/disc_demo_score": mean_disc_demo_score,
+                    "amp/disc_replay_score": mean_disc_replay_score,
+                }
+        else:
+            # Skip interval: reuse last disc metrics so logs are not zero-spiked.
+            mean_disc_loss = self._last_disc_metrics["amp/disc_loss"]
+            mean_disc_grad_penalty = self._last_disc_metrics["amp/disc_grad_penalty"]
+            mean_disc_score = self._last_disc_metrics["amp/disc_score"]
+            mean_disc_demo_score = self._last_disc_metrics["amp/disc_demo_score"]
+            mean_disc_replay_score = self._last_disc_metrics["amp/disc_replay_score"]
+
+        self._amp_update_count += 1
 
         loss_dict = {
             "value": mean_value_loss,
@@ -311,6 +396,11 @@ class PPOAMP(PPO):
             "amp/disc_grad_penalty": mean_disc_grad_penalty,
             "amp/disc_score": mean_disc_score,
             "amp/disc_demo_score": mean_disc_demo_score,
+            "amp/disc_replay_score": mean_disc_replay_score,
+            "amp/disc_replay_size": float(len(self.disc_replay_buffer)) if self.disc_replay_buffer else 0.0,
+            "amp/disc_replay_pushed": float(replay_pushed),
+            "amp/disc_updated": float(update_disc),
+            "amp/disc_num_updates": float(num_disc_updates),
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -322,8 +412,12 @@ class PPOAMP(PPO):
 
     def train_mode(self) -> None:
         super().train_mode()
-        self.amp_discriminator.train()
-        self.amp_discriminator.disc_obs_normalizer.train()
+        if self.freeze_discriminator:
+            self.amp_discriminator.eval()
+            self.amp_discriminator.disc_obs_normalizer.eval()
+        else:
+            self.amp_discriminator.train()
+            self.amp_discriminator.disc_obs_normalizer.train()
 
     def eval_mode(self) -> None:
         super().eval_mode()
@@ -363,16 +457,29 @@ class PPOAMP(PPO):
         torch.distributed.broadcast_object_list(model_params, src=0)
         self.amp_discriminator.load_state_dict(model_params[0])
 
-    def reduce_parameters(self) -> None:
-        all_params = chain(
-            self.actor.parameters(),
-            self.critic.parameters(),
-            self.amp_discriminator.parameters(),
-        )
+    def reduce_parameters(self, include_disc: bool = True) -> None:
+        all_params = chain(self.actor.parameters(), self.critic.parameters())
+        if include_disc:
+            all_params = chain(all_params, self.amp_discriminator.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         all_params = list(all_params)
         grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+        offset = 0
+        for param in all_params:
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel
+
+    def reduce_disc_parameters(self) -> None:
+        all_params = list(self.amp_discriminator.parameters())
+        grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
+        if not grads:
+            return
         all_grads = torch.cat(grads)
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
@@ -419,6 +526,11 @@ class PPOAMP(PPO):
             device=device,
         )
 
+        disc_replay_buffer = None
+        replay_size = cfg["algorithm"]["amp_cfg"].get("disc_replay_buffer_size")
+        if replay_size:
+            disc_replay_buffer = DiscReplayBuffer(max_size=int(replay_size), device=device)
+
         alg: PPOAMP = alg_class(
             actor,
             critic,
@@ -426,6 +538,7 @@ class PPOAMP(PPO):
             disc_obs_buffer,
             disc_demo_obs_buffer,
             cfg["obs_groups"],
+            disc_replay_buffer,
             device=device,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],

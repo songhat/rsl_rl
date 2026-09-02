@@ -94,8 +94,9 @@ class OnPolicyRunner:
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
-                    # Book keeping
-                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+                    # Book keeping (aggregate multi-column decoupled rewards for logging)
+                    rewards_log = rewards.mean(dim=-1) if rewards.ndim > 1 else rewards
+                    self.logger.process_env_step(rewards_log, dones, extras, intrinsic_rewards)
 
                 stop = time.time()
                 collect_time = stop - start

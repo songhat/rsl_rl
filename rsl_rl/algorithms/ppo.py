@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import inspect
 import torch
 import torch.nn as nn
 from itertools import chain
@@ -51,6 +52,9 @@ class PPO:
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
         device: str = "cpu",
+        muon_learning_rate: float = 0.02,
+        muon_momentum: float = 0.95,
+        muon_weight_decay: float = 0.0,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -88,10 +92,43 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
-        # Create the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
-        )  # type: ignore
+        # Muon is deliberately limited to hidden MLP weights. Its authors advise using
+        # AdamW for output heads, biases, and normalization parameters.
+        self.muon_optimizer: torch.optim.Optimizer | None = None
+        self._muon_base_learning_rate = muon_learning_rate
+        if optimizer == "muon_adamw":
+            try:
+                from muon import SingleDeviceMuon
+            except ImportError as exc:
+                raise ImportError(
+                    "optimizer='muon_adamw' requires the `muon-optimizer` package. "
+                    "Install it with `pip install git+https://github.com/KellerJordan/Muon.git`."
+                ) from exc
+
+            hidden_weights: list[nn.Parameter] = []
+            for model in (self.actor, self.critic):
+                mlp = getattr(model, "mlp", None)
+                linear_layers = [layer for layer in mlp if isinstance(layer, nn.Linear)] if mlp else []
+                if len(linear_layers) < 2:
+                    raise ValueError("muon_adamw requires actor and critic MLPs with hidden layers.")
+                hidden_weights.extend(layer.weight for layer in linear_layers[:-1])
+            hidden_weight_ids = {id(param) for param in hidden_weights}
+            adamw_params = [
+                param
+                for param in chain(self.actor.parameters(), self.critic.parameters())
+                if id(param) not in hidden_weight_ids
+            ]
+            self.optimizer = torch.optim.AdamW(adamw_params, lr=learning_rate)
+            self.muon_optimizer = SingleDeviceMuon(
+                hidden_weights,
+                lr=muon_learning_rate,
+                momentum=muon_momentum,
+                weight_decay=muon_weight_decay,
+            )
+        else:
+            self.optimizer = resolve_optimizer(optimizer)(
+                chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            )  # type: ignore
 
         # Add storage
         self.storage = storage
@@ -110,7 +147,18 @@ class PPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self._initial_learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
+    def set_learning_rate(self, learning_rate: float) -> None:
+        """Update AdamW and, when enabled, Muon learning rates together."""
+        self.learning_rate = learning_rate
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = learning_rate
+        if self.muon_optimizer is not None:
+            scale = learning_rate / self._initial_learning_rate
+            for param_group in self.muon_optimizer.param_groups:
+                param_group["lr"] = self._muon_base_learning_rate * scale
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -254,9 +302,7 @@ class PPO:
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                    self.set_learning_rate(self.learning_rate)
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
@@ -288,6 +334,8 @@ class PPO:
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
+            if self.muon_optimizer is not None:
+                self.muon_optimizer.zero_grad()
             loss.backward()
             # Compute the gradients for RND
             if self.rnd:
@@ -302,6 +350,8 @@ class PPO:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            if self.muon_optimizer is not None:
+                self.muon_optimizer.step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -364,6 +414,8 @@ class PPO:
             "critic_state_dict": self._raw_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
+        if self.muon_optimizer is not None:
+            saved_dict["muon_optimizer_state_dict"] = self.muon_optimizer.state_dict()
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
@@ -388,6 +440,8 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            if self.muon_optimizer is not None and "muon_optimizer_state_dict" in loaded_dict:
+                self.muon_optimizer.load_state_dict(loaded_dict["muon_optimizer_state_dict"])
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
@@ -428,12 +482,26 @@ class PPO:
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
-        # Initialize the policy
-        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        # Initialize the policy (drop cfg keys unused by the selected model class).
+        actor_kwargs = {
+          k: v
+          for k, v in cfg["actor"].items()
+          if k in inspect.signature(actor_class).parameters and v is not None
+        }
+        actor: MLPModel = actor_class(
+          obs, cfg["obs_groups"], "actor", env.num_actions, **actor_kwargs
+        ).to(device)
         print(f"Actor Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+        critic_kwargs = {
+          k: v
+          for k, v in cfg["critic"].items()
+          if k in inspect.signature(critic_class).parameters and v is not None
+        }
+        critic: MLPModel = critic_class(
+          obs, cfg["obs_groups"], "critic", 1, **critic_kwargs
+        ).to(device)
         print(f"Critic Model: {critic}")
 
         # Initialize the storage

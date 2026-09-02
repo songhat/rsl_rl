@@ -28,6 +28,7 @@ class AMPDiscriminator(nn.Module):
         activation: str = "relu",
         style_reward_scale: float = 1.0,
         task_style_lerp: float = 0.0,
+        reward_steepness: float = 1.0,
         device: str = "cpu",
     ):
         super().__init__()
@@ -38,8 +39,10 @@ class AMPDiscriminator(nn.Module):
         self.obs_groups = obs_groups
         activation = resolve_nn_activation(activation)
         assert style_reward_scale >= 0, "AMP reward scale must be non-negative."
+        assert reward_steepness > 0, "WGAN reward steepness must be positive."
         self.style_reward_scale = style_reward_scale
         self.task_style_lerp = task_style_lerp
+        self.reward_steepness = float(reward_steepness)
         self.device = device
         self.loss_type = loss_type
 
@@ -58,11 +61,6 @@ class AMPDiscriminator(nn.Module):
 
         print(f"AMP Discriminator MLP: {self.disc_trunk}")
         print(f"AMP Discriminator Output Layer: {self.disc_linear}")
-
-        if self.loss_type == LossType.WGAN:
-            self.disc_output_normalizer = EmpiricalNormalization(shape=1, until=int(1e8)).to(device)
-        else:
-            self.disc_output_normalizer = torch.nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass for the AMP Discriminator."""
@@ -135,8 +133,16 @@ class AMPDiscriminator(nn.Module):
         disc_obs_reshaped = disc_obs.reshape(-1, self.disc_obs_dim)
         self.disc_obs_normalizer.update(disc_obs_reshaped)
 
-    def compute_grad_penalty(self, demo_data: torch.Tensor, scale: float = 10.0) -> torch.Tensor:
-        """Compute the gradient penalty for the AMP Discriminator."""
+    def compute_grad_penalty(
+        self, demo_data: torch.Tensor, scale: float = 10.0, target_norm: float = 0.0
+    ) -> torch.Tensor:
+        """Compute the gradient penalty for the AMP Discriminator.
+
+        Args:
+            demo_data: Samples to evaluate gradients on.
+            scale: Penalty coefficient λ.
+            target_norm: Desired ||∇C||₂ (0 for AMP-style GP, 1 for WGAN-GP).
+        """
         assert len(demo_data.shape) == 2, (
             "Demonstration data must be a 2D tensor (num_samples, disc_obs_dim * disc_obs_steps)."
         )
@@ -154,7 +160,7 @@ class AMPDiscriminator(nn.Module):
             only_inputs=True,
         )[0]
 
-        grad_penalty = scale * (grad.norm(2, dim=1) - 0).pow(2).mean()
+        grad_penalty = scale * (grad.norm(2, dim=1) - target_norm).pow(2).mean()
         return grad_penalty
 
     def predict_style_reward(self, disc_obs: torch.Tensor, dt: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -187,7 +193,11 @@ class AMPDiscriminator(nn.Module):
             elif self.loss_type == LossType.LSGAN:
                 rew = torch.clamp(1 - (1 / 4) * torch.square(disc_score - 1), min=0)
             elif self.loss_type == LossType.WGAN:
-                rew = self.disc_output_normalizer(disc_score)
+                # Unbounded critic → [0, 1]; higher D = more demo-like.
+                # Larger reward_steepness → steeper tanh (saturates faster).
+                # rew = self.disc_output_normalizer(disc_score)
+                # rew = 0.5 * (torch.tanh(self.reward_steepness * disc_score) + 1.0)
+                rew = 1/15 * disc_score # normalize
             else:
                 raise ValueError(
                     f"Unknown AMP loss type: {self.loss_type}. Should be 'GAN', 'LSGAN', or 'WGAN'"
@@ -197,8 +207,8 @@ class AMPDiscriminator(nn.Module):
 
             if was_training:
                 self.train()
-                if self.loss_type == LossType.WGAN:
-                    self.disc_output_normalizer.update(disc_score)
+                # if self.loss_type == LossType.WGAN:
+                #     self.disc_output_normalizer.update(disc_score)
 
         return style_reward.squeeze(-1), disc_score.squeeze(-1)
 

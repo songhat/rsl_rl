@@ -12,6 +12,20 @@ and features common algorithms for robot learning.
 - **High-throughput training** with native Multi-GPU support.
 - **Proven performance** in numerous research publications.
 
+## Extensions (this fork)
+
+This repository extends upstream [RSL-RL](https://github.com/leggedrobotics/rsl_rl) for **mjlab / humanoid RL** research. Highlights:
+
+- **AMP (`PPOAMP`, `AMPRunner`)**: adversarial motion prior with task + style reward mixing; discriminator supports **BCE / LSGAN / WGAN-GP** and optional adaptive style scale.
+- **AMP replay**: `DiscReplayBuffer` and replay helpers for terminal / demo disc observations.
+- **ASE (`PPOASE`, `ASERunner`)**: AMP + encoder / MI-style reward for transfer and style learning.
+- **SMP (`PPOSMP`, `SMPRunner`)**: task reward + frozen diffusion prior (SDS-style style reward), no online discriminator.
+- **Decoupled PPO (`PPODecoupled`)**: separate lower-body / upper-body policies for locomotion + manipulation.
+- **FPO + AMP (`FPOAMP`)**: flow-policy variant with AMP-style discriminator training.
+- **Models / utils**: `MoEMLPModel`, `ASEDiscriminatorEncoder`, AMP / ASE / SMP loggers, diff normalizer.
+
+Used together with [unitree_rl_mjlab](https://github.com/songhat/unitree_rl_mjlab) tasks such as velocity tracking, AMP-v2, ASE, and SMP.
+
 ## Learning Environments
 
 RSL-RL is currently used by the following robot learning libraries:

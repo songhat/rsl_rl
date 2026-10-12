@@ -36,13 +36,16 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         except KeyError:
             entity = None
 
-        # Initialize wandb
+        # Initialize wandb. start_method was removed from wandb.Settings in 0.30+.
+        settings = None
+        if "start_method" in getattr(wandb.Settings, "model_fields", {}):
+            settings = wandb.Settings(start_method="thread")
         wandb.init(
             project=project_name,
             entity=entity,
             name=run_name,
             config={"log_dir": log_dir},
-            settings=wandb.Settings(start_method="thread"),
+            settings=settings,
         )
 
         # Initialize set to keep track of logged videos

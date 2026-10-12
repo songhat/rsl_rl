@@ -5,6 +5,7 @@
 
 """Learning algorithms."""
 
+from .amp_ppo import AmpPPO
 from .distillation import Distillation
 from .fpo import FPO
 from .fpo_amp import FPOAMP
@@ -14,4 +15,14 @@ from .ppo_ase import PPOASE
 from .ppo_decoupled import PPODecoupled
 from .ppo_smp import PPOSMP
 
-__all__ = ["PPO", "PPOAMP", "PPOASE", "PPOSMP", "FPO", "FPOAMP", "Distillation", "PPODecoupled"]
+__all__ = [
+    "PPO",
+    "PPOAMP",
+    "AmpPPO",
+    "PPOASE",
+    "PPOSMP",
+    "FPO",
+    "FPOAMP",
+    "Distillation",
+    "PPODecoupled",
+]

@@ -67,3 +67,38 @@ def compute_amp_disc_loss(
     )
     disc_loss = disc_loss + disc_grad_penalty
     return disc_loss, disc_grad_penalty
+
+
+def compute_finite_difference_penalty(
+    amp_discriminator: AMPDiscriminator,
+    loss_type: LossType,
+    demo_data_flat: torch.Tensor,
+    agent_data_flat: torch.Tensor,
+    grad_penalty_scale: float,
+    *,
+    n_probes: int = 1,
+    eps: float = 1e-3,
+    gp_batch_frac: float = 1.0,
+) -> torch.Tensor:
+    """Same interpolation points as WGAN-GP, but the norm is a finite-difference estimate."""
+    if loss_type == LossType.WGAN:
+        n = min(demo_data_flat.shape[0], agent_data_flat.shape[0])
+        mix = torch.rand(n, 1, device=demo_data_flat.device, dtype=demo_data_flat.dtype)
+        gp_data = mix * demo_data_flat[:n] + (1.0 - mix) * agent_data_flat[:n]
+        target_norm = 1.0
+    else:
+        gp_data = demo_data_flat
+        target_norm = 0.0
+
+    if 0.0 < gp_batch_frac < 1.0 and gp_data.shape[0] > 1:
+        k = max(1, int(gp_data.shape[0] * gp_batch_frac))
+        idx = torch.randint(0, gp_data.shape[0], (k,), device=gp_data.device)
+        gp_data = gp_data[idx]
+
+    return amp_discriminator.compute_fd_grad_penalty(
+        gp_data,
+        scale=grad_penalty_scale,
+        target_norm=target_norm,
+        n_probes=n_probes,
+        eps=eps,
+    )

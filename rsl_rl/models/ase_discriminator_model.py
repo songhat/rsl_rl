@@ -34,7 +34,7 @@ class ASEDiscriminatorEncoder(AMPDiscriminator):
         activation: str = "relu",
         style_reward_scale: float = 1.0,
         task_style_lerp: float = 0.0,
-        reward_steepness: float = 1.0,
+        reward_score_scale: float = 1.0 / 15.0,
         device: str = "cpu",
     ) -> None:
         super().__init__(
@@ -46,7 +46,7 @@ class ASEDiscriminatorEncoder(AMPDiscriminator):
             activation=activation,
             style_reward_scale=style_reward_scale,
             task_style_lerp=task_style_lerp,
-            reward_steepness=reward_steepness,
+            reward_score_scale=reward_score_scale,
             device=device,
         )
         self.latent_dim = int(latent_dim)

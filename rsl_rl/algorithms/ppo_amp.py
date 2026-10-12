@@ -10,8 +10,8 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
-from rsl_rl.models.discriminator_model import AMPDiscriminator, LossType, resolve_amp_config
-from rsl_rl.algorithms.amp_replay_utils import compute_amp_disc_loss
+from rsl_rl.algorithms.amp_replay_utils import compute_amp_disc_loss, compute_finite_difference_penalty
+from rsl_rl.models.discriminator_model import AMPDiscriminator, LossType, apply_spectral_norm_, resolve_amp_config
 from rsl_rl.storage import CircularBuffer, DiscReplayBuffer, RolloutStorage
 from rsl_rl.storage.disc_replay_buffer import agent_disc_obs_with_replay, store_disc_replay_from_rollout
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
@@ -101,6 +101,17 @@ class PPOAMP(PPO):
             device=device,
             **self.amp_cfg.get("amp_discriminator", {}),
         ).to(self.device)
+        self.lipschitz = str(self.amp_cfg.get("lipschitz", "grad_penalty"))
+        if self.lipschitz == "spectral_norm":
+            apply_spectral_norm_(self.amp_discriminator)
+            print("[INFO] Discriminator Lipschitz: spectral norm (gradient penalty off).")
+        elif self.lipschitz not in ("grad_penalty", "finite_difference"):
+            raise ValueError(
+                f"Unknown discriminator lipschitz mode '{self.lipschitz}'. "
+                "Use 'grad_penalty', 'spectral_norm', or 'finite_difference'."
+            )
+        self.fd_probes = max(1, int(self.amp_cfg.get("fd_probes", 1)))
+        self.fd_epsilon = float(self.amp_cfg.get("fd_epsilon", 1e-3))
 
         params = [
             {
@@ -174,17 +185,31 @@ class PPOAMP(PPO):
         self.disc_demo_obs_buffer.append(disc_demo_obs)
         super().process_env_step(obs, self.rewards_lerp, dones, extras)
 
+    def compile(self, mode: str | None = None) -> None:
+        """Compile actor and critic.
+
+        The discriminator is left eager: WGAN-GP calls ``autograd.grad(..., create_graph=True)``,
+        and ``torch.compile`` does not support that double backward.
+        """
+        super().compile(mode)
+        if mode is not None:
+            print(
+                f"[INFO] torch.compile mode={mode} on actor and critic; "
+                "discriminator stays eager because WGAN-GP needs double backward."
+            )
+
     def update(self) -> dict[str, float]:
-        mean_value_loss = 0
-        mean_surrogate_loss = 0
-        mean_entropy = 0
-        mean_rnd_loss = 0 if self.rnd else None
-        mean_symmetry_loss = 0 if self.symmetry else None
-        mean_disc_loss = 0
-        mean_disc_grad_penalty = 0
-        mean_disc_score = 0
-        mean_disc_demo_score = 0
-        mean_disc_replay_score = 0
+        # Keep sums on device and sync once. Per-step ``.item()`` was leaving the GPU idle.
+        sum_value_loss = torch.zeros((), device=self.device)
+        sum_surrogate_loss = torch.zeros((), device=self.device)
+        sum_entropy = torch.zeros((), device=self.device)
+        sum_rnd_loss = torch.zeros((), device=self.device) if self.rnd else None
+        sum_symmetry_loss = torch.zeros((), device=self.device) if self.symmetry else None
+        sum_disc_loss = torch.zeros((), device=self.device)
+        sum_disc_grad_penalty = torch.zeros((), device=self.device)
+        sum_disc_score = torch.zeros((), device=self.device)
+        sum_disc_demo_score = torch.zeros((), device=self.device)
+        sum_disc_replay_score = torch.zeros((), device=self.device)
 
         fetch_length = self.storage.num_transitions_per_env  # type: ignore
         replay_pushed = store_disc_replay_from_rollout(
@@ -287,22 +312,22 @@ class PPOAMP(PPO):
             if self.rnd:
                 self.rnd.optimizer.step()
 
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            mean_entropy += entropy.mean().item()
-            if mean_rnd_loss is not None:
-                mean_rnd_loss += rnd_loss.item()
-            if mean_symmetry_loss is not None:
-                mean_symmetry_loss += symmetry_loss.item()
+            sum_value_loss = sum_value_loss + value_loss.detach()
+            sum_surrogate_loss = sum_surrogate_loss + surrogate_loss.detach()
+            sum_entropy = sum_entropy + entropy.detach().mean()
+            if sum_rnd_loss is not None:
+                sum_rnd_loss = sum_rnd_loss + rnd_loss.detach()
+            if sum_symmetry_loss is not None:
+                sum_symmetry_loss = sum_symmetry_loss + symmetry_loss.detach()
 
         num_ac_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_ac_updates
-        mean_surrogate_loss /= num_ac_updates
-        mean_entropy /= num_ac_updates
-        if mean_rnd_loss is not None:
-            mean_rnd_loss /= num_ac_updates
-        if mean_symmetry_loss is not None:
-            mean_symmetry_loss /= num_ac_updates
+        mean_value_loss = (sum_value_loss / num_ac_updates).item()
+        mean_surrogate_loss = (sum_surrogate_loss / num_ac_updates).item()
+        mean_entropy = (sum_entropy / num_ac_updates).item()
+        mean_rnd_loss = (sum_rnd_loss / num_ac_updates).item() if sum_rnd_loss is not None else None
+        mean_symmetry_loss = (
+            (sum_symmetry_loss / num_ac_updates).item() if sum_symmetry_loss is not None else None
+        )
 
         # ---- Discriminator updates (optional interval / epoch count) ----
         update_disc = (not self.freeze_discriminator) and (
@@ -334,7 +359,10 @@ class PPOAMP(PPO):
                     disc_demo_obs_batch_normed.reshape(current_batch_size, -1)
                 )
 
-                apply_gp = self._disc_step_count % self.disc_grad_penalty_interval == 0
+                apply_gp = (
+                    self.lipschitz == "grad_penalty"
+                    and self._disc_step_count % self.disc_grad_penalty_interval == 0
+                )
                 disc_loss, disc_grad_penalty = compute_amp_disc_loss(
                     self.amp_discriminator,
                     self.loss_type,
@@ -346,6 +374,18 @@ class PPOAMP(PPO):
                     apply_grad_penalty=apply_gp,
                     gp_batch_frac=self.disc_grad_penalty_batch_frac,
                 )
+                if self.lipschitz == "finite_difference":
+                    disc_grad_penalty = compute_finite_difference_penalty(
+                        self.amp_discriminator,
+                        self.loss_type,
+                        disc_demo_obs_batch_normed.reshape(current_batch_size, -1),
+                        agent_disc_flat[:current_batch_size],
+                        float(self.amp_cfg["grad_penalty_scale"]),
+                        n_probes=self.fd_probes,
+                        eps=self.fd_epsilon,
+                        gp_batch_frac=self.disc_grad_penalty_batch_frac,
+                    )
+                    disc_loss = disc_loss + disc_grad_penalty
 
                 self.disc_optimizer.zero_grad()
                 disc_loss.backward()
@@ -357,20 +397,22 @@ class PPOAMP(PPO):
                 self.amp_discriminator.update_normalization(disc_obs_batch)
                 self._disc_step_count += 1
 
-                mean_disc_loss += disc_loss.item()
-                mean_disc_grad_penalty += disc_grad_penalty.item()
-                mean_disc_score += disc_score.mean().item()
-                mean_disc_demo_score += disc_demo_score.mean().item()
+                sum_disc_loss = sum_disc_loss + disc_loss.detach()
+                sum_disc_grad_penalty = sum_disc_grad_penalty + disc_grad_penalty.detach()
+                sum_disc_score = sum_disc_score + disc_score.detach().mean()
+                sum_disc_demo_score = sum_disc_demo_score + disc_demo_score.detach().mean()
                 if disc_score.shape[0] > current_batch_size:
-                    mean_disc_replay_score += disc_score[current_batch_size:].mean().item()
+                    sum_disc_replay_score = (
+                        sum_disc_replay_score + disc_score[current_batch_size:].detach().mean()
+                    )
                 num_disc_updates += 1
 
             if num_disc_updates > 0:
-                mean_disc_loss /= num_disc_updates
-                mean_disc_grad_penalty /= num_disc_updates
-                mean_disc_score /= num_disc_updates
-                mean_disc_demo_score /= num_disc_updates
-                mean_disc_replay_score /= num_disc_updates
+                mean_disc_loss = (sum_disc_loss / num_disc_updates).item()
+                mean_disc_grad_penalty = (sum_disc_grad_penalty / num_disc_updates).item()
+                mean_disc_score = (sum_disc_score / num_disc_updates).item()
+                mean_disc_demo_score = (sum_disc_demo_score / num_disc_updates).item()
+                mean_disc_replay_score = (sum_disc_replay_score / num_disc_updates).item()
                 self._last_disc_metrics = {
                     "amp/disc_loss": mean_disc_loss,
                     "amp/disc_grad_penalty": mean_disc_grad_penalty,
@@ -378,6 +420,12 @@ class PPOAMP(PPO):
                     "amp/disc_demo_score": mean_disc_demo_score,
                     "amp/disc_replay_score": mean_disc_replay_score,
                 }
+            else:
+                mean_disc_loss = 0.0
+                mean_disc_grad_penalty = 0.0
+                mean_disc_score = 0.0
+                mean_disc_demo_score = 0.0
+                mean_disc_replay_score = 0.0
         else:
             # Skip interval: reuse last disc metrics so logs are not zero-spiked.
             mean_disc_loss = self._last_disc_metrics["amp/disc_loss"]

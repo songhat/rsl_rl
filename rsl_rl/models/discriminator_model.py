@@ -28,7 +28,7 @@ class AMPDiscriminator(nn.Module):
         activation: str = "relu",
         style_reward_scale: float = 1.0,
         task_style_lerp: float = 0.0,
-        reward_steepness: float = 1.0,
+        reward_score_scale: float = 1.0 / 15.0,
         device: str = "cpu",
     ):
         super().__init__()
@@ -39,10 +39,10 @@ class AMPDiscriminator(nn.Module):
         self.obs_groups = obs_groups
         activation = resolve_nn_activation(activation)
         assert style_reward_scale >= 0, "AMP reward scale must be non-negative."
-        assert reward_steepness > 0, "WGAN reward steepness must be positive."
+        assert reward_score_scale > 0, "WGAN reward score scale must be positive."
         self.style_reward_scale = style_reward_scale
         self.task_style_lerp = task_style_lerp
-        self.reward_steepness = float(reward_steepness)
+        self.reward_score_scale = float(reward_score_scale)
         self.device = device
         self.loss_type = loss_type
 
@@ -163,6 +163,33 @@ class AMPDiscriminator(nn.Module):
         grad_penalty = scale * (grad.norm(2, dim=1) - target_norm).pow(2).mean()
         return grad_penalty
 
+    def compute_fd_grad_penalty(
+        self,
+        data: torch.Tensor,
+        scale: float = 10.0,
+        target_norm: float = 1.0,
+        n_probes: int = 1,
+        eps: float = 1e-3,
+    ) -> torch.Tensor:
+        """Approximate ``(||∇_x D|| - target)^2`` with central finite differences.
+
+        Probes are standard normal. ``E[(∇D · z)^2] = ||∇D||^2``, so the penalty
+        backward is a normal first-order backward and can be compiled.
+        """
+        if data.ndim != 2:
+            raise ValueError("Finite-difference penalty expects (batch, features).")
+        batch, features = data.shape
+        probes = max(1, int(n_probes))
+        base = data.detach()
+        direction = torch.randn(probes, batch, features, device=base.device, dtype=base.dtype)
+        step = eps * direction
+        base_b = base.unsqueeze(0)
+        packed = torch.cat((base_b + step, base_b - step), dim=0).reshape(2 * probes * batch, features)
+        values = self.forward(packed).view(2, probes, batch)
+        directional = (values[0] - values[1]) / (2.0 * eps)
+        grad_norm = directional.pow(2).mean(dim=0).clamp_min(0.0).sqrt()
+        return scale * (grad_norm - target_norm).pow(2).mean()
+
     def predict_style_reward(self, disc_obs: torch.Tensor, dt: float) -> tuple[torch.Tensor, torch.Tensor]:
         if len(disc_obs.shape) != 3:
             raise ValueError(
@@ -193,11 +220,8 @@ class AMPDiscriminator(nn.Module):
             elif self.loss_type == LossType.LSGAN:
                 rew = torch.clamp(1 - (1 / 4) * torch.square(disc_score - 1), min=0)
             elif self.loss_type == LossType.WGAN:
-                # Unbounded critic → [0, 1]; higher D = more demo-like.
-                # Larger reward_steepness → steeper tanh (saturates faster).
-                # rew = self.disc_output_normalizer(disc_score)
-                # rew = 0.5 * (torch.tanh(self.reward_steepness * disc_score) + 1.0)
-                rew = 1/15 * disc_score # normalize
+                # Unbounded critic score → scaled style reward (higher D = more demo-like).
+                rew = self.reward_score_scale * disc_score
             else:
                 raise ValueError(
                     f"Unknown AMP loss type: {self.loss_type}. Should be 'GAN', 'LSGAN', or 'WGAN'"
@@ -269,3 +293,21 @@ def resolve_amp_config(alg_cfg: dict, obs: TensorDict, obs_groups: dict, env: Ve
     alg_cfg["amp_cfg"]["step_dt"] = unwrapped.step_dt
 
     return alg_cfg
+
+
+def apply_spectral_norm_(disc: AMPDiscriminator, n_power_iterations: int = 1) -> None:
+    """Constrain each linear map to spectral norm 1.
+
+    ELU has derivative in (0, 1], so the composed network is 1-Lipschitz.
+    Call this before the optimizer is built; parameter objects change.
+    """
+    from torch.nn.utils.parametrizations import spectral_norm
+
+    trunk = []
+    for layer in disc.disc_trunk:
+        if isinstance(layer, nn.Linear):
+            trunk.append(spectral_norm(layer, n_power_iterations=n_power_iterations))
+        else:
+            trunk.append(layer)
+    disc.disc_trunk = nn.Sequential(*trunk)
+    disc.disc_linear = spectral_norm(disc.disc_linear, n_power_iterations=n_power_iterations)
